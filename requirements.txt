@@ -1,4 +1,3 @@
 Flask==2.3.2
-requests
-google-cloud-firestore
-gunicorn
+requests==2.31.0
+google-cloud-firestore==2.13.0
