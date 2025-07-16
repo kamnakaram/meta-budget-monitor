@@ -1,18 +1,17 @@
 import os
 import requests
 from datetime import datetime, timedelta
-from flask import Flask, request
+from flask import Flask
+from google.cloud import firestore
 
 app = Flask(__name__)
 
-# Replace with your Meta Ad Account ID
 AD_ACCOUNT_ID = "1381598392129251"
-
-# Google Chat Webhook
-CHAT_WEBHOOK = "https://chat.googleapis.com/v1/spaces/AAAAivwuEaY/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=tEFGbnqCvsOGnBQ8tV489CcZrFX2yrp6GQ82h-6bztM="
-
-# Meta Access Token (you’ll inject this as a secret in Cloud later)
 ACCESS_TOKEN = os.environ.get("META_ACCESS_TOKEN")
+CHAT_WEBHOOK = os.environ.get("CHAT_WEBHOOK")
+FIRESTORE_PROJECT_ID = os.environ.get("GCP_PROJECT")
+
+db = firestore.Client(project=FIRESTORE_PROJECT_ID)
 
 def send_alert(message):
     requests.post(CHAT_WEBHOOK, json={"text": message})
@@ -21,46 +20,58 @@ def is_within_working_hours():
     now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     return 10 <= now_ist.hour < 19
 
+def get_existing_budgets():
+    doc_ref = db.collection("adset_budgets").document("latest")
+    doc = doc_ref.get()
+    return doc.to_dict() if doc.exists else {}
+
+def update_budgets(new_data):
+    db.collection("adset_budgets").document("latest").set(new_data)
+
 @app.route("/", methods=["GET"])
-def monitor_budget():
+def monitor():
     if not is_within_working_hours():
         return "Outside working hours", 200
 
     try:
-        campaigns_url = f"https://graph.facebook.com/v18.0/act_{AD_ACCOUNT_ID}/campaigns"
-        campaigns_resp = requests.get(campaigns_url, params={
+        url = f"https://graph.facebook.com/v18.0/act_{AD_ACCOUNT_ID}/adsets"
+        response = requests.get(url, params={
             "access_token": ACCESS_TOKEN,
-            "fields": "name,status,daily_budget,effective_status,lifetime_spend",
+            "fields": "name,daily_budget,effective_status",
             "limit": 100
         })
-        campaigns_resp.raise_for_status()
-        campaigns = campaigns_resp.json().get("data", [])
+        response.raise_for_status()
+        adsets = response.json().get("data", [])
 
-        alerts = []
+        old_data = get_existing_budgets()
+        new_data = {}
+        changes = []
 
-        for c in campaigns:
-            name = c["name"]
-            if "PMAX" in name.upper() or "DEMAND GEN" in name.upper():
-                daily_budget = int(c.get("daily_budget", 0)) / 100  # Convert to rupees
-                status = c.get("effective_status")
-                spend = float(c.get("lifetime_spend", 0)) / 100  # Convert to rupees
+        for adset in adsets:
+            adset_id = adset.get("id")
+            name = adset.get("name")
+            budget = int(adset.get("daily_budget", 0)) / 100
+            status = adset.get("effective_status")
 
-                if daily_budget == 0 or status != "ACTIVE":
-                    alerts.append(f"⚠️ Campaign *{name}* is *{status}* with ₹{daily_budget} budget")
-                else:
-                    alerts.append(f"✅ *{name}* — ₹{daily_budget:.0f}/day — Total Spend ₹{spend:.0f}")
+            new_data[adset_id] = budget
 
-        if alerts:
-            send_alert("\n".join(alerts))
+            if adset_id not in old_data:
+                changes.append(f"🆕 *{name}* added with ₹{budget:.0f}/day")
+            elif old_data[adset_id] != budget:
+                changes.append(f"✏️ *{name}* budget changed: ₹{old_data[adset_id]:.0f} → ₹{budget:.0f}")
+
+        if changes:
+            send_alert("🔔 *Meta Ad Set Budget Updates:*\n" + "\n".join(changes))
         else:
-            send_alert("✅ No PMAX or Demand Gen campaigns found.")
+            send_alert("✅ No Meta ad set budget changes detected.")
 
+        update_budgets(new_data)
         return "Checked", 200
 
     except Exception as e:
-        send_alert(f"🚨 Meta Budget Monitor Failed:\n{str(e)}")
+        send_alert(f"🚨 Budget Monitor Error:\n{str(e)}")
         return "Error", 500
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
